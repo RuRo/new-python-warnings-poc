@@ -15,3 +15,39 @@ Keep in mind, that the current implementation:
 
 - Is currently not backwards compatible.
   (I've added some new fields and parameters, which probably breaks monkey-patching)
+
+You can see an example comparison between old and new warnings by running `./compare_warnings.sh` or `./compare_warnings_in_docker.sh` if you don't have Python 3.11 installed locally.
+
+### Examples
+
+#### Old Warnings
+
+```python
+/long/path/to/code/that/may/end/up/wrapping/example.py:27: UserWarning: This is a regular warning.
+  warnings.warn("This is a regular warning.")
+```
+```python
+/long/path/to/code/that/may/end/up/wrapping/example.py:28: DeprecationWarning: old_baz is deprecated in version X, use new_baz instead.
+  bar(old_baz() + 1)
+```
+```python
+/long/path/to/code/that/may/end/up/wrapping/example.py:19: VeryImportantWarning: This is a very important warning, you need to fix it!
+  warnings.warn(
+```
+
+#### New Warnings
+
+```python
+File "/long/path/to/code/that/may/end/up/wrapping/example.py", line 27, in foo
+  UserWarning: This is a regular warning.
+```
+```python
+File "/long/path/to/code/that/may/end/up/wrapping/example.py", line 28, in foo
+  bar(old_baz() + 1)
+      ^^^^^^^^^
+  DeprecationWarning: old_baz is deprecated in version X, use new_baz instead.
+```
+```python
+File "/long/path/to/code/that/may/end/up/wrapping/example.py", line 19, in bar
+  VeryImportantWarning: This is a very important warning, you need to fix it!
+```
