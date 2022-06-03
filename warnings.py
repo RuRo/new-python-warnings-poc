@@ -1,6 +1,10 @@
 """Python part of the warnings subsystem."""
 
+import os
 import sys
+import itertools
+from contextlib import suppress
+from traceback import _byte_offset_to_character_offset, _extract_caret_anchors_from_line_segment
 
 
 __all__ = ["warn", "warn_explicit", "showwarning",
@@ -32,7 +36,51 @@ def _showwarnmsg_impl(msg):
         # the file (probably stderr) is invalid - this warning gets lost.
         pass
 
-def _formatwarnmsg_impl(msg):
+def _format_source_line(original_line, position=None):
+    line = original_line.strip()
+    source_line = f"  {line}\n"
+    if position is None:
+        return source_line
+
+    row = [source_line]
+    lineno, end_lineno, colno, end_colno = position
+    orig_line_len = len(original_line)
+    frame_line_len = len(line.lstrip())
+    stripped_characters = orig_line_len - frame_line_len
+    if (
+        colno is not None
+        and end_colno is not None
+    ):
+        colno = _byte_offset_to_character_offset(
+            original_line, colno)
+        end_colno = _byte_offset_to_character_offset(
+            original_line, end_colno)
+
+        anchors = None
+        if lineno == end_lineno:
+            if True:
+            #with suppress(Exception):
+                anchors = _extract_caret_anchors_from_line_segment(
+                    original_line[colno - 1:end_colno - 1]
+                )
+        else:
+            end_colno = stripped_characters + len(line.strip())
+
+        row.append('  ')
+        row.append(' ' * (colno - stripped_characters))
+
+        if anchors:
+            row.append(anchors.primary_char * (anchors.left_end_offset))
+            row.append(anchors.secondary_char * (anchors.right_start_offset - anchors.left_end_offset))
+            row.append(anchors.primary_char * (end_colno - colno - anchors.right_start_offset))
+        else:
+            row.append('^' * (end_colno - colno))
+
+        row.append('\n')
+
+    return "".join(row)
+
+def _old_formatwarnmsg_impl(msg):
     category = msg.category.__name__
     s =  f"{msg.filename}:{msg.lineno}: {category}: {msg.message}\n"
 
@@ -50,6 +98,75 @@ def _formatwarnmsg_impl(msg):
     if line:
         line = line.strip()
         s += "  %s\n" % line
+
+    if msg.source is not None:
+        try:
+            import tracemalloc
+        # Logging a warning should not raise a new exception:
+        # catch Exception, not only ImportError and RecursionError.
+        except Exception:
+            # don't suggest to enable tracemalloc if it's not available
+            tracing = True
+            tb = None
+        else:
+            tracing = tracemalloc.is_tracing()
+            try:
+                tb = tracemalloc.get_object_traceback(msg.source)
+            except Exception:
+                # When a warning is logged during Python shutdown, tracemalloc
+                # and the import machinery don't work anymore
+                tb = None
+
+        if tb is not None:
+            s += 'Object allocated at (most recent call last):\n'
+            for frame in tb:
+                s += ('  File "%s", lineno %s\n'
+                      % (frame.filename, frame.lineno))
+
+                try:
+                    if linecache is not None:
+                        line = linecache.getline(frame.filename, frame.lineno)
+                    else:
+                        line = None
+                except Exception:
+                    line = None
+                if line:
+                    line = line.strip()
+                    s += '    %s\n' % line
+        elif not tracing:
+            s += (f'{category}: Enable tracemalloc to get the object '
+                  f'allocation traceback\n')
+    return s
+
+def _formatwarnmsg_impl(msg):
+    if os.environ.get("OLDPYTHONWARNINGS", None):
+        return _old_formatwarnmsg_impl(msg)
+
+    category = msg.category.__name__
+    s =  f'File "{msg.filename}", line {msg.lineno}'
+    if msg.funcname is not None:
+        s += f", in {msg.funcname}\n"
+    else:
+        s += "\n"
+
+    try:
+        import linecache
+    except Exception:
+        # When a warning is logged during Python shutdown, linecache
+        # and the import machinery don't work anymore
+        linecache = None
+
+    if not msg.show_source_line or linecache is None:
+        line = None
+    elif msg.line is None:
+        line = linecache.getline(msg.filename, msg.lineno)
+    else:
+        line = msg.line
+
+    if line:
+        s += _format_source_line(line, msg.position)
+
+    s += f"  {category}: {msg.message}\n"
 
     if msg.source is not None:
         try:
@@ -284,7 +401,7 @@ def _next_external_frame(frame):
 
 
 # Code typically replaced by _warnings
-def warn(message, category=None, stacklevel=1, source=None):
+def warn(message, category=None, stacklevel=None, source=None):
     """Issue a warning, or maybe ignore it or raise an exception."""
     # Check if message is already a Warning object
     if isinstance(message, Warning):
@@ -296,6 +413,11 @@ def warn(message, category=None, stacklevel=1, source=None):
         raise TypeError("category must be a Warning subclass, "
                         "not '{:s}'".format(type(category).__name__))
     # Get context information
+    if stacklevel is None:
+        stacklevel = 1
+        show_source_line = False
+    else:
+        show_source_line = True
     try:
         if stacklevel <= 1 or _is_internal_frame(sys._getframe(1)):
             # If frame is too small to care or if the warning originated in
@@ -312,21 +434,32 @@ def warn(message, category=None, stacklevel=1, source=None):
         globals = sys.__dict__
         filename = "sys"
         lineno = 1
+        position = None
+        funcname = None
     else:
         globals = frame.f_globals
         filename = frame.f_code.co_filename
+        funcname = frame.f_code.co_name
         lineno = frame.f_lineno
+        position = _get_warning_position(frame)
     if '__name__' in globals:
         module = globals['__name__']
     else:
         module = "<string>"
     registry = globals.setdefault("__warningregistry__", {})
     warn_explicit(message, category, filename, lineno, module, registry,
-                  globals, source)
+                  globals, source, funcname, position, show_source_line)
+
+
+def _get_warning_position(frame):
+    lasti = frame.f_lasti
+    positions = frame.f_code.co_positions()
+    return next(itertools.islice(positions, lasti // 2, None))
+
 
 def warn_explicit(message, category, filename, lineno,
                   module=None, registry=None, module_globals=None,
-                  source=None):
+                  source=None, funcname=None, position=None, show_source_line=True):
     lineno = int(lineno)
     if module is None:
         module = filename or "<unknown>"
@@ -361,10 +494,11 @@ def warn_explicit(message, category, filename, lineno,
     if action == "ignore":
         return
 
-    # Prime the linecache for formatting, in case the
-    # "file" is actually in a zipfile or something.
-    import linecache
-    linecache.getlines(filename, module_globals)
+    if show_source_line:
+        # Prime the linecache for formatting, in case the
+        # "file" is actually in a zipfile or something.
+        import linecache
+        linecache.getlines(filename, module_globals)
 
     if action == "error":
         raise message
@@ -391,17 +525,21 @@ def warn_explicit(message, category, filename, lineno,
               "Unrecognized action (%r) in warnings.filters:\n %s" %
               (action, item))
     # Print message and context
-    msg = WarningMessage(message, category, filename, lineno, source)
+    msg = WarningMessage(
+        message, category, filename, lineno, source=source,
+        funcname=funcname, position=position, show_source_line=show_source_line,
+    )
     _showwarnmsg(msg)
 
 
 class WarningMessage(object):
 
     _WARNING_DETAILS = ("message", "category", "filename", "lineno", "file",
-                        "line", "source")
+                        "line", "source", "funcname", "position", "show_source_line")
 
     def __init__(self, message, category, filename, lineno, file=None,
-                 line=None, source=None):
+                 line=None, source=None, funcname=None, position=None,
+                 show_source_line=True):
         self.message = message
         self.category = category
         self.filename = filename
@@ -409,6 +547,9 @@ class WarningMessage(object):
         self.file = file
         self.line = line
         self.source = source
+        self.funcname = funcname
+        self.position = position
+        self.show_source_line = show_source_line
         self._category_name = category.__name__ if category else None
 
     def __str__(self):
@@ -546,6 +687,7 @@ def _warn_unawaited_coroutine(coro):
 # - a line number for the line being warning, or 0 to mean any line
 # If either if the compiled regexs are None, match anything.
 try:
+    raise ImportError("Force use python version of warnings.")
     from _warnings import (filters, _defaultaction, _onceregistry,
                            warn, warn_explicit, _filters_mutated)
     defaultaction = _defaultaction
